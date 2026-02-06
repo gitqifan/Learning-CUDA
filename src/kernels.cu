@@ -3,6 +3,53 @@
 
 #include "../tester/utils.h"
 
+// CUDA_CHECK宏
+#define CUDA_CHECK(expr) do { \
+  cudaError_t err = expr; \
+  if (err != cudaSuccess) { \
+      fprintf(stderr, "CUDA Error: %s (line %d): %s\n", __FILE__, __LINE__, cudaGetErrorString(err)); \
+      exit(EXIT_FAILURE); \
+  } \
+} while (0)
+
+
+template <class T>
+__device__ T warp_reduce(T value) {
+#pragma unroll
+    for (size_t offset = warpSize/2; offset > 0; offset >>= 1) {
+        value += __shfl_down_sync(0xFFFFFFFF, value, offset);
+    }
+
+    return value;
+}
+
+template <typename T, size_t BLOCK_SIZE>
+__global__ void traceKernel(const T* input, T* output, size_t n) {
+  __shared__ T smem[BLOCK_SIZE];
+  size_t tid = threadIdx.x;
+  size_t idx = blockIdx.x * blockDim.x + tid;
+
+  T sum = 0;
+  for (size_t i = idx; i < n; i += blockDim.x * gridDim.x) {
+      sum += input[i];
+  }
+
+  T warp_sum = warp_reduce(sum);
+  
+  if(tid % warpSize == 0) {
+      smem[tid/warpSize] = warp_sum;
+  }
+  __syncthreads();
+
+  if(tid < warpSize) {
+      T block_sum = (tid < (blockDim.x + 31)/warpSize) ? smem[tid] : T{0};
+      block_sum = warp_reduce(block_sum);
+      if(tid == 0) {
+          atomicAdd(output, block_sum);
+      }
+  }
+}
+
 /**
  * @brief Computes the trace of a matrix.
  *
@@ -19,9 +66,50 @@
  */
 template <typename T>
 T trace(const std::vector<T>& h_input, size_t rows, size_t cols) {
-  // TODO: Implement the trace function
-  return T(-1);
+  size_t min_dim = (rows < cols) ? rows : cols;
+
+  std::vector<T> h_diagonal(min_dim); // 减少拷贝数量，只拷贝对角线元素
+  for (size_t i = 0; i < min_dim; ++i) {
+    h_diagonal[i] = h_input[i * cols + i];
+  }
+
+  T *diagonal;
+  T* d_result;
+  CUDA_CHECK(cudaMalloc(&diagonal, min_dim * sizeof(T)));
+  CUDA_CHECK(cudaMalloc(&d_result, sizeof(T)));
+
+  // 数据拷贝到 Device
+  CUDA_CHECK(cudaMemcpy(diagonal, h_diagonal.data(), min_dim * sizeof(T), cudaMemcpyHostToDevice));
+
+  // 调用CUDA kernel，问题演变为求和
+  dim3 blockSize = 1024;
+  dim3 numBlocks = (min_dim + blockSize.x - 1) / blockSize.x;
+  traceKernel<T, 1024><<<numBlocks, blockSize>>>(diagonal, d_result, min_dim);
+
+  // 将结果从 Device 拷回 Host
+  T h_result;
+  CUDA_CHECK(cudaMemcpy(&h_result, d_result, sizeof(T), cudaMemcpyDeviceToHost));
+
+  // 释放 GPU 内存
+  CUDA_CHECK(cudaFree(diagonal));
+  CUDA_CHECK(cudaFree(d_result));
+
+  return h_result;
 }
+
+// test
+// template <typename T>
+// T trace(const std::vector<T>& h_input, size_t rows, size_t cols) {
+//     T sum = T{0};
+//     int m = (rows < cols)? rows : cols;
+//     for(size_t i = 0; i < m; ++i) {
+//       if(i*cols + i < h_input.size()) {
+//         sum += h_input[i*cols + i];
+//       }
+//     }
+
+//     return sum;
+// }
 
 /**
  * @brief Computes flash attention for given query, key, and value tensors.
@@ -44,7 +132,7 @@ void flashAttention(const std::vector<T>& h_q, const std::vector<T>& h_k,
                     const std::vector<T>& h_v, std::vector<T>& h_o,
                     int batch_size, int target_seq_len, int src_seq_len, 
                     int query_heads, int kv_heads, int head_dim, bool is_causal) {       
-  // TODO: Implement the flash attention function
+  // 没做完
 }
 
 // *********************************************************************
